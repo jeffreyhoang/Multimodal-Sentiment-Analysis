@@ -1,19 +1,18 @@
 import torch
 import torch.nn as nn
-from torch.optim import AdamW
+from torch.optim import AdamW, Adam, SGD
 from torch.utils.data import Dataset, DataLoader
-
-from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
+from torchvision.transforms import transforms
+from torchvision.models import resnet18, ResNet18_Weights
 
 import re
 import random
 import copy
 import pandas as pd
+from PIL import Image
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import precision_score, recall_score, f1_score
-
-print('Dependencies imported succesfully!')
+from sklearn.metrics import accuracy_score, classification_report, precision_score, recall_score, f1_score
 
 # =============================================================
 # Set Random Seed
@@ -94,20 +93,22 @@ val_df, test_df = train_test_split(
 
 print('Data split succesfully!')
 
+
 # =============================================================
 # Training Configuration
 # =============================================================
-BERT_MODEL_NAME = 'bert-base-uncased'
 NUM_CLASSES = 3
-MAX_LENGTH = 256
-BATCH_SIZE = 32
-LEARNING_RATE = 3e-5
-WEIGHT_DECAY = 1e-4
+BATCH_SIZE = 16
 DROPOUT = 0.1
+WEIGHT_DECAY = 1e-4
 NUM_EPOCHS = 8
 
+FC_LR = 1e-4
+LAYER_4LR = 1e-5
+lAYER3_LR = 1e-6
+LAYER2_LR = 1e-7
+
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-TOKENIZER = AutoTokenizer.from_pretrained(BERT_MODEL_NAME)
 
 print('Training configuration set up succesfully!')
 print(f'Device: {DEVICE}')
@@ -116,50 +117,64 @@ print(f'Device: {DEVICE}')
 # =============================================================
 # Dataset Class
 # =============================================================
-class TextDataset(Dataset):
-    def __init__(self, texts, labels, tokenizer, max_len):
-        self.texts = texts
+class ImageDataset(Dataset):
+    def __init__(self, image_paths, labels, transforms=None):
+        self.image_paths = image_paths
         self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+        self.transforms = transforms
 
     def __len__(self):
-        return len(self.texts)
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        text = str(self.texts[idx])
+        image_path = str(self.image_paths[idx])
         label = self.labels[idx]
 
-        encoding = self.tokenizer(
-            text,
-            add_special_tokens=True,
-            truncation=True,
-            padding='max_length',
-            max_length=self.max_len,
-            return_tensors='pt'
-        )
+        img = Image.open(image_path).convert('RGB')
+
+        if self.transforms:
+            img = self.transforms(img)
 
         return {
-            'input_ids': encoding['input_ids'].squeeze(0),
-            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'images': img,
             'labels': torch.tensor(label, dtype=torch.long)
         }
 
 
 # =============================================================
+# Image Transformations
+# =============================================================
+train_transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.RandomResizedCrop(224),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+val_test_transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+
+# =============================================================
 # Initialize Dataset and Dataloaders
 # =============================================================
-train_texts = train_df['text'].tolist()
-val_texts = val_df['text'].tolist()
-test_texts = test_df['text'].tolist()
+train_image_paths = train_df['image'].tolist()
+val_image_paths = val_df['image'].tolist()
+test_image_paths = test_df['image'].tolist()
 
 train_labels = train_df['label'].tolist()
 val_labels = val_df['label'].tolist()
 test_labels = test_df['label'].tolist()
 
-train_dataset = TextDataset(train_texts, train_labels, TOKENIZER, max_len=MAX_LENGTH)
-val_dataset = TextDataset(val_texts, val_labels, TOKENIZER, max_len=MAX_LENGTH)
-test_dataset = TextDataset(test_texts, test_labels, TOKENIZER, max_len=MAX_LENGTH)
+train_dataset = ImageDataset(train_image_paths, train_labels, train_transform)
+val_dataset = ImageDataset(val_image_paths, val_labels, val_test_transform)
+test_dataset = ImageDataset(test_image_paths, test_labels, val_test_transform)
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
@@ -171,55 +186,47 @@ print('Dataset and Dataloaders initialized succesfully!')
 # =============================================================
 # Text-Only Model Class
 # =============================================================
-class BERTClassifier(nn.Module):
-    def __init__(self, model_name, num_labels, dropout):
+class ResnetClassifier(nn.Module):
+    def __init__(self, num_classes, dropout):
         super().__init__()
 
-        self.bert = AutoModel.from_pretrained(model_name)
+        weights = ResNet18_Weights.DEFAULT
+        self.model = resnet18(weights=weights)
 
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(self.bert.config.hidden_size, num_labels)
+        self.model.fc = nn.Sequential(
+        nn.Linear(self.model.fc.in_features, 256),
+        nn.BatchNorm1d(256),
+        nn.ReLU(),
+        nn.Dropout(dropout),
+        nn.Linear(256, num_classes)
         )
 
-    def forward(self, input_ids, attention_mask):
-        outputs = self.bert(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-
-        cls_output = outputs.last_hidden_state[:, 0, :]
-
-        logits = self.classifier(cls_output)
-
-        return logits
-
+    def forward(self, x):
+        return self.model(x)
 
 # =============================================================
 # Train Function
 # =============================================================
-def train(model, data_loader, criterion, optimizer, scheduler, device):
+def train(model, data_loader, criterion, optimizer, device):
     model.train()
     train_loss = 0.0
     train_correct = 0
     train_total = 0
 
     for batch in data_loader:
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
+        images = batch['images'].to(device)
         labels = batch['labels'].to(device)
 
         optimizer.zero_grad()
-    
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-    
+
+        outputs = model(x=images)
+
         loss = criterion(outputs, labels)
-    
+
         loss.backward()
         optimizer.step()
-        scheduler.step()
-    
-        train_loss += loss.item() * input_ids.size(0)
+
+        train_loss += loss.item() * images.size(0)
         preds = outputs.argmax(dim=1)
         train_correct += (preds == labels).sum().item()
         train_total += labels.size(0)
@@ -240,19 +247,18 @@ def evaluate(model, data_loader, criterion, device):
     val_total = 0
 
     all_preds = []
-    all_true= []
+    all_true = []
 
     with torch.no_grad():
         for batch in data_loader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
+            images = batch['images'].to(device)
             labels = batch['labels'].to(device)
-    
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+            outputs = model(x=images)
 
             loss = criterion(outputs, labels)
-            
-            val_loss += loss.item() * input_ids.size(0)
+
+            val_loss += loss.item() * images.size(0)
             preds = outputs.argmax(dim=1)
             val_correct += (preds == labels).sum().item()
             val_total += labels.size(0)
@@ -262,10 +268,11 @@ def evaluate(model, data_loader, criterion, device):
 
     avg_val_loss = val_loss / val_total
     val_acc = val_correct / val_total
-    
+
     val_precision = precision_score(all_true, all_preds, average='macro', zero_division=0)
     val_recall = recall_score(all_true, all_preds, average='macro', zero_division=0)
     val_f1 = f1_score(all_true, all_preds, average='macro', zero_division=0)
+
 
     return avg_val_loss, val_acc, val_precision, val_recall, val_f1
 
@@ -275,23 +282,29 @@ print('Train and evaluation functions initialized succesfully!')
 # =============================================================
 # Initialize Model
 # =============================================================
-model = BERTClassifier(BERT_MODEL_NAME, NUM_CLASSES, DROPOUT).to(DEVICE)
+model = ResnetClassifier(NUM_CLASSES, DROPOUT).to(DEVICE)
 
-torch.cuda.empty_cache()    # Clear GPU cache
+for param in model.model.parameters():
+    param.requires_grad = False
 
-optimizer = AdamW(      # Initialize optimizer
-    model.parameters(), 
-    lr=LEARNING_RATE,
-    weight_decay=WEIGHT_DECAY
-)
+for param in model.model.fc.parameters():
+    param.requires_grad = True
+
+for param in model.model.layer4.parameters():
+    param.requires_grad = True
+
+for param in model.model.layer3.parameters():
+    param.requires_grad = True
+
+torch.cuda.empty_cache()        # Clear GPU cache
+
+optimizer = AdamW([     # Initialize optimizer
+    {'params': model.model.fc.parameters(), 'lr': FC_LR},
+    {'params': model.model.layer4.parameters(), 'lr': LAYER_4LR},
+    {'params': model.model.layer3.parameters(), 'lr': lAYER3_LR} 
+], weight_decay=WEIGHT_DECAY)
 
 criterion = nn.CrossEntropyLoss()       # Initialize loss function
-
-total_steps = len(train_loader) * NUM_EPOCHS
-scheduler = get_linear_schedule_with_warmup(        # Initialize learning rate scheduler
-    optimizer, num_warmup_steps=0, 
-    num_training_steps=total_steps
-)
 
 print('Model configuration initialized succesfully!\n')
 
@@ -306,7 +319,7 @@ best_model_state = None
 print('Training loop started:')
 for epoch in range(NUM_EPOCHS):
     print(f"Epoch {epoch + 1}/{NUM_EPOCHS}")
-    train_loss, train_acc = train(model, train_loader, criterion, optimizer, scheduler, DEVICE)
+    train_loss, train_acc = train(model, train_loader, criterion, optimizer, DEVICE)
     val_loss, val_acc, val_precision, val_recall, val_f1 = evaluate(model, val_loader, criterion, DEVICE)
     print(f'Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Train Accuracy: {train_acc:.4f} | Val Accuracy: {val_acc:.4f} | Val F1: {val_f1:.4f}')
     print()
@@ -323,13 +336,12 @@ print('Training loop ended.\n')
 # =============================================================
 model.load_state_dict(best_model_state)
 test_loss, test_acc, test_precision, test_recall, test_f1 = evaluate(model, test_loader, criterion, DEVICE)
-print('Text-only model evaluation on test set:')
+print('Image-only model evaluation on test set:')
 print(f'Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f} | Test Precision: {test_precision:.4f} | Test Recall: {test_recall:.4f} | Test F1: {test_f1:.4f}')
-
 
 # =============================================================
 # Save Best Model
 # =============================================================
-torch.save(best_model_state, 'best_text_model.pth')
+torch.save(best_model_state, 'best_image_model.pth')
 
 print('Best model saved successfully!')
