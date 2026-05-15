@@ -33,9 +33,14 @@ print('Data loaded succesfully!')
 # =============================================================
 # Preprocess data
 # =============================================================
-df = df[df['text'] == df['image']]      # Filter inconsistent labels
-df = df.drop(columns=['image'])     # Drop image label column
-df = df.rename(columns={'text': 'label'})       # Rename label column
+# Filter inconsistent labels
+df = df[df['text'] == df['image']] 
+
+# Drop image label column
+df = df.drop(columns=['image']) 
+
+# Rename label column
+df = df.rename(columns={'text': 'label'})
 
 # Clean text data (not applied)
 def clean_standard(text):
@@ -93,6 +98,7 @@ val_df, test_df = train_test_split(
 )
 
 print('Data split succesfully!')
+
 
 # =============================================================
 # Training Configuration
@@ -231,7 +237,7 @@ def train(model, data_loader, criterion, optimizer, scheduler, device):
 
 
 # =============================================================
-# Evaluate Function for 1 Epoch
+# Evaluate Function
 # =============================================================
 def evaluate(model, data_loader, criterion, device):
     model.eval()
@@ -277,18 +283,22 @@ print('Train and evaluation functions initialized succesfully!')
 # =============================================================
 model = BERTClassifier(BERT_MODEL_NAME, NUM_CLASSES, DROPOUT).to(DEVICE)
 
-torch.cuda.empty_cache()    # Clear GPU cache
+# Clear GPU cache
+torch.cuda.empty_cache()
 
-optimizer = AdamW(      # Initialize optimizer
+# Initialize optimizer
+optimizer = AdamW(    
     model.parameters(), 
     lr=LEARNING_RATE,
     weight_decay=WEIGHT_DECAY
 )
 
-criterion = nn.CrossEntropyLoss()       # Initialize loss function
+ # Initialize loss function
+criterion = nn.CrossEntropyLoss()      
 
+# Initialize learning rate scheduler
 total_steps = len(train_loader) * NUM_EPOCHS
-scheduler = get_linear_schedule_with_warmup(        # Initialize learning rate scheduler
+scheduler = get_linear_schedule_with_warmup(        
     optimizer, num_warmup_steps=0, 
     num_training_steps=total_steps
 )

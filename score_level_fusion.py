@@ -5,6 +5,8 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import transforms
 from torchvision.models import resnet18, ResNet18_Weights
 
+from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
+
 import re
 import random
 import copy
@@ -12,7 +14,7 @@ import pandas as pd
 from PIL import Image
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, classification_report, precision_score, recall_score, f1_score
 
 # =============================================================
 # Set Random Seed
@@ -33,7 +35,7 @@ print('Data loaded succesfully!')
 # Preprocess data
 # =============================================================
 # Filter inconsistent labels
-df = df[df['text'] == df['image']]  
+df = df[df['text'] == df['image']] 
 
 # Drop image label column
 df = df.drop(columns=['image'])     
@@ -102,16 +104,22 @@ print('Data split succesfully!')
 # =============================================================
 # Training Configuration
 # =============================================================
+TEXT_MODEL_NAME = 'bert-base-uncased'
+SEQUENCE_LENGTH = 256
+TOKENIZER = AutoTokenizer.from_pretrained(TEXT_MODEL_NAME)
+
 NUM_CLASSES = 3
 BATCH_SIZE = 16
 DROPOUT = 0.1
 WEIGHT_DECAY = 1e-4
 NUM_EPOCHS = 8
 
+BERT_LR = 3e-5
 FC_LR = 1e-4
-LAYER_4LR = 1e-5
-lAYER3_LR = 1e-6
-LAYER2_LR = 1e-7
+LAYER4_LR = 1e-5
+LAYER3_LR = 1e-6
+MULTIMODAL_CLASSIFIER_LR = 1e-4
+W_LR = 5e-4
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -122,29 +130,44 @@ print(f'Device: {DEVICE}')
 # =============================================================
 # Dataset Class
 # =============================================================
-class ImageDataset(Dataset):
-    def __init__(self, image_paths, labels, transforms=None):
+class TextImageDataset(Dataset):
+    def __init__(self, texts, image_paths, labels, tokenizer, max_len, transforms):
+        self.texts = texts
         self.image_paths = image_paths
         self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
         self.transforms = transforms
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.labels)
 
     def __getitem__(self, idx):
+        text = str(self.texts[idx])
         image_path = str(self.image_paths[idx])
         label = self.labels[idx]
 
-        img = Image.open(image_path).convert('RGB')
+        # tokenize text
+        encoding = self.tokenizer(
+            text,
+            add_special_tokens=True,
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_len,
+            return_tensors='pt'
+        )
 
+        # load image
+        img = Image.open(image_path).convert('RGB')
         if self.transforms:
             img = self.transforms(img)
 
         return {
-            'images': img,
-            'labels': torch.tensor(label, dtype=torch.long)
+            'input_ids': encoding['input_ids'].squeeze(0),
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'image': img,
+            'label': torch.tensor(label, dtype=torch.long)
         }
-
 
 # =============================================================
 # Image Transformations
@@ -165,10 +188,13 @@ val_test_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-
 # =============================================================
 # Initialize Dataset and Dataloaders
 # =============================================================
+train_texts = train_df['text'].tolist()
+val_texts = val_df['text'].tolist()
+test_texts = test_df['text'].tolist()
+
 train_image_paths = train_df['image'].tolist()
 val_image_paths = val_df['image'].tolist()
 test_image_paths = test_df['image'].tolist()
@@ -177,9 +203,9 @@ train_labels = train_df['label'].tolist()
 val_labels = val_df['label'].tolist()
 test_labels = test_df['label'].tolist()
 
-train_dataset = ImageDataset(train_image_paths, train_labels, train_transform)
-val_dataset = ImageDataset(val_image_paths, val_labels, val_test_transform)
-test_dataset = ImageDataset(test_image_paths, test_labels, val_test_transform)
+train_dataset = TextImageDataset(train_texts, train_image_paths, train_labels, TOKENIZER, SEQUENCE_LENGTH, train_transform)
+val_dataset = TextImageDataset(val_texts, val_image_paths, val_labels, TOKENIZER, SEQUENCE_LENGTH, val_test_transform)
+test_dataset = TextImageDataset(test_texts, test_image_paths, test_labels, TOKENIZER, SEQUENCE_LENGTH, val_test_transform)
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
@@ -189,25 +215,47 @@ print('Dataset and Dataloaders initialized succesfully!')
 
 
 # =============================================================
-# Image-Only Model Class
+# Score-Level Fusion Class
 # =============================================================
-class ResnetClassifier(nn.Module):
-    def __init__(self, num_classes, dropout):
+class ScoreLevelFusionClassifier(nn.Module):
+    def __init__(self, text_model_name, num_classes, dropout):
         super().__init__()
 
-        weights = ResNet18_Weights.DEFAULT
-        self.model = resnet18(weights=weights)
-
-        self.model.fc = nn.Sequential(
-        nn.Linear(self.model.fc.in_features, 256),
-        nn.BatchNorm1d(256),
-        nn.ReLU(),
-        nn.Dropout(dropout),
-        nn.Linear(256, num_classes)
+        # Text classifier
+        self.bert = AutoModel.from_pretrained(text_model_name)
+        self.text_classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(self.bert.config.hidden_size, num_classes)
         )
 
-    def forward(self, x):
-        return self.model(x)
+        # Image classifier
+        weights = ResNet18_Weights.DEFAULT
+        self.resnet = resnet18(weights=weights)
+        self.resnet.fc = nn.Sequential(
+            nn.Linear(self.resnet.fc.in_features, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_classes)
+        )
+
+        self.w = nn.Parameter(torch.tensor(0.8473))
+  
+    def forward(self, input_ids, attention_mask, image):
+        # text logits
+        text_outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        text_cls_output = text_outputs.last_hidden_state[:, 0, :]
+        text_logits = self.text_classifier(text_cls_output)
+
+        # image logits
+        image_logits = self.resnet(image)
+
+        # fuse
+        alpha = torch.sigmoid(self.w)
+        fused_logits = (text_logits * alpha + image_logits * (1 - alpha))
+
+        return fused_logits
+
 
 # =============================================================
 # Train Function
@@ -219,12 +267,14 @@ def train(model, data_loader, criterion, optimizer, device):
     train_total = 0
 
     for batch in data_loader:
-        images = batch['images'].to(device)
-        labels = batch['labels'].to(device)
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        images = batch['image'].to(device)
+        labels = batch['label'].to(device)
 
         optimizer.zero_grad()
 
-        outputs = model(x=images)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, image=images)
 
         loss = criterion(outputs, labels)
 
@@ -256,10 +306,12 @@ def evaluate(model, data_loader, criterion, device):
 
     with torch.no_grad():
         for batch in data_loader:
-            images = batch['images'].to(device)
-            labels = batch['labels'].to(device)
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            images = batch['image'].to(device)
+            labels = batch['label'].to(device)
 
-            outputs = model(x=images)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, image=images)
 
             loss = criterion(outputs, labels)
 
@@ -278,7 +330,6 @@ def evaluate(model, data_loader, criterion, device):
     val_recall = recall_score(all_true, all_preds, average='macro', zero_division=0)
     val_f1 = f1_score(all_true, all_preds, average='macro', zero_division=0)
 
-
     return avg_val_loss, val_acc, val_precision, val_recall, val_f1
 
 print('Train and evaluation functions initialized succesfully!')
@@ -287,32 +338,44 @@ print('Train and evaluation functions initialized succesfully!')
 # =============================================================
 # Initialize Model
 # =============================================================
-model = ResnetClassifier(NUM_CLASSES, DROPOUT).to(DEVICE)
+model = ScoreLevelFusionClassifier(TEXT_MODEL_NAME, NUM_CLASSES, DROPOUT).to(DEVICE)
 
-for param in model.model.parameters():
+for param in model.parameters():
     param.requires_grad = False
 
-for param in model.model.fc.parameters():
+for param in model.bert.parameters():
+     param.requires_grad = True
+
+for param in model.text_classifier.parameters():
     param.requires_grad = True
 
-for param in model.model.layer4.parameters():
+for param in model.resnet.fc.parameters():
     param.requires_grad = True
 
-for param in model.model.layer3.parameters():
+for param in model.resnet.layer4.parameters():
+    param.requires_grad = True
+
+for param in model.resnet.layer3.parameters():
+    param.requires_grad = True
+
+for param in [model.w]:
     param.requires_grad = True
 
 # Clear GPU cache
-torch.cuda.empty_cache()        
+torch.cuda.empty_cache()
 
-# Initialize optimizer
+# Optimizer configuration
 optimizer = AdamW([
-    {'params': model.model.fc.parameters(), 'lr': FC_LR},
-    {'params': model.model.layer4.parameters(), 'lr': LAYER_4LR},
-    {'params': model.model.layer3.parameters(), 'lr': lAYER3_LR} 
-], weight_decay=WEIGHT_DECAY)
+    {'params': model.bert.parameters(), 'lr': BERT_LR, 'weight_decay': WEIGHT_DECAY},
+    {'params': model.text_classifier.parameters(), 'lr': BERT_LR, 'weight_decay': WEIGHT_DECAY},
+    {'params': model.resnet.fc.parameters(), 'lr': FC_LR, 'weight_decay': WEIGHT_DECAY},
+    {'params': model.resnet.layer4.parameters(), 'lr': LAYER4_LR, 'weight_decay': WEIGHT_DECAY},
+    {'params': model.resnet.layer3.parameters(), 'lr': LAYER3_LR, 'weight_decay': WEIGHT_DECAY},
+    {'params': [model.w], 'lr': W_LR, 'weight_decay': 0.0}
+])
 
 # Initialize loss function
-criterion = nn.CrossEntropyLoss() 
+criterion = nn.CrossEntropyLoss()
 
 print('Model configuration initialized succesfully!\n')
 
@@ -325,17 +388,18 @@ best_epoch = -1
 best_model_state = None
 
 print('Training loop started:')
-for epoch in range(NUM_EPOCHS):
-    print(f"Epoch {epoch + 1}/{NUM_EPOCHS}")
-    train_loss, train_acc = train(model, train_loader, criterion, optimizer, DEVICE)
-    val_loss, val_acc, val_precision, val_recall, val_f1 = evaluate(model, val_loader, criterion, DEVICE)
-    print(f'Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Train Accuracy: {train_acc:.4f} | Val Accuracy: {val_acc:.4f} | Val F1: {val_f1:.4f}')
-    print()
 
-    if val_f1 > best_val_f1:
-        best_val_f1 = val_f1
-        best_epoch = epoch + 1
-        best_model_state = copy.deepcopy(model.state_dict())
+for epoch in range(NUM_EPOCHS):
+  print(f'Epoch {epoch + 1}/{NUM_EPOCHS}')
+  train_loss, train_acc = train(model, train_loader, criterion, optimizer, DEVICE)
+  val_loss, val_acc, val_precision, val_recall, val_f1 = evaluate(model, val_loader, criterion, DEVICE)
+  print(f'Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Train Accuracy: {train_acc:.4f} | Val Accuracy: {val_acc:.4f} | Val F1: {val_f1:.4f}')
+  print()
+
+  if val_f1 > best_val_f1:
+    best_val_f1 = val_f1
+    best_epoch = epoch + 1
+    best_model_state = copy.deepcopy(model.state_dict())
 
 print('Training loop ended.\n')
 
@@ -344,12 +408,12 @@ print('Training loop ended.\n')
 # =============================================================
 model.load_state_dict(best_model_state)
 test_loss, test_acc, test_precision, test_recall, test_f1 = evaluate(model, test_loader, criterion, DEVICE)
-print('Image-only model evaluation on test set:')
+print('Score-level fusion model evaluation on test set:')
 print(f'Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f} | Test Precision: {test_precision:.4f} | Test Recall: {test_recall:.4f} | Test F1: {test_f1:.4f}')
 
 # =============================================================
 # Save Best Model
 # =============================================================
-torch.save(best_model_state, 'best_image_model.pth')
+torch.save(best_model_state, 'best_score_level_model.pth')
 
 print('Best model saved successfully!')

@@ -12,7 +12,7 @@ pip install -r requirements.txt
 
 ## Dataset
 
-Download the MVSA-Single dataset and place the extracted folder in the project root directory: https://www.kaggle.com/datasets/vincemarcs/mvsasingle
+Download the MVSA-Single dataset and place the extracted folder in the project root directory: https://www.kaggle.com/datasets/vincemarcs/mvsasingle 
 
 Expected structure:
 
