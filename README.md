@@ -4,6 +4,45 @@ This project uses the **MVSA-Single** (Multi-View Sentiment Analysis) dataset, w
 
 ---
 
+## Tech Stack
+
+| Category        | Tools / Libraries                                      |
+|-----------------|--------------------------------------------------------|
+| Language        | Python                                                 |
+| Deep Learning   | PyTorch, Torchvision                                   |
+| NLP / Text      | Hugging Face Transformers (`bert-base-uncased`)        |
+| Vision / Image  | ResNet-18 (pretrained on ImageNet via Torchvision)     |
+| Data Processing | Pandas, Scikit-learn, Pillow                           |
+| Hardware        | Google Colab, NVIDIA A100 GPU                          |
+
+---
+
+## Models
+
+### BERT (Text)
+
+The text encoder uses `bert-base-uncased` loaded via the Hugging Face `transformers` library. The `[CLS]` token representation from the final hidden state is passed through a dropout layer and a single linear classification head to produce logits over the three sentiment classes. All BERT parameters are fine-tuned end-to-end using AdamW with a linear learning rate schedule and warmup.
+
+- **Optimizer:** AdamW (lr=3e-5, weight decay=1e-4)
+- **Scheduler:** Linear decay with warmup
+- **Max token length:** 256
+- **Epochs:** 8
+
+### ResNet-18 (Image)
+
+The image encoder uses a pretrained ResNet-18 (ImageNet weights). The original fully connected head is replaced with a custom classifier: `Linear(512→256) → BatchNorm → ReLU → Dropout → Linear(256→3)`. To prevent overfitting, only the final classifier, layer4, and layer3 are unfrozen, with discriminative learning rates applied per layer group.
+
+- **Optimizer:** AdamW with layer-wise learning rates
+  - FC head: lr=1e-4
+  - Layer 4: lr=1e-5
+  - Layer 3: lr=1e-6
+- **Weight decay:** 1e-4
+- **Epochs:** 8
+- **Image size:** 224×224 (ResizedCrop + HorizontalFlip + Rotation for training; CenterCrop for val/test)
+- **Normalization:** ImageNet mean/std
+
+---
+
 ## Setup
 
 Install required dependencies:
